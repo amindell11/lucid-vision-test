@@ -1,0 +1,5 @@
+use Bayer8 RGB and binning on Triton to increase FPS (full resolution caps out the bandwidth)
+
+exposure on helios can be set with ExposureTimeSelector, good estting is Exp250Us
+
+make sure the range setting on helios is set properly (operating mode and distance Min/max) otherwise will give bad depth readings
