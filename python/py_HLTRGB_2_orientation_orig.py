@@ -28,135 +28,35 @@ from arena_api import enums
 from arena_api.system import system
 from arena_api.buffer import BufferFactory
 from arena_api.enums import PixelFormat
-'''
-Helios RGB: Orientation
-    This example is part 2 of a 3-part example on color overlay over 3D images.
-    Color data can be overlaid over 3D images by reading the 
-    3D points ABC (XYZ) from the Helios and projecting them onto
-    the Triton color (RGB) camera directly. This requires first solving for the
-    orientation of the Helios coordinate system relative to the Triton’s
-    native coordinate space (rotation and translation wise). This step can be
-    achieved by using the open function solvePnP(). Solving for orientation of
-    the Helios relative to the Triton requires a single image of the
-    calibration target from each camera. Place the calibration target near the
-    center of both cameras field of view and at an appropriate distance from
-    the cameras. Make sure the calibration target is placed at the same
-    distance you will be imaging in your application. Make sure not to move the
-    calibration target or cameras in between grabbing the Helios image and
-    grabbing the Triton image.
-'''
-
-'''
-Settings
-'''
-TAB1 = "  "
-TAB2 = "    "
-
-# image timeout
+from common.lucid_vision import (
+    TAB1,TAB2,TRITON,HELIOS2,
+    create_devices_with_tries,
+    get_applicable_devices,
+    convert_buffer_to_Coord3D_ABCY16,
+    convert_buffer_to_Mono8,
+    read_calibration,
+    write_orientation,
+)
+from common.node_overrides import CameraOverrides
 TIMEOUT = 2000
 
-# calibration values file name
 FILE_NAME_IN = 'tritoncalibration.yml'
 
-# orientation values file name
 FILE_NAME_OUT = "orientation.yml"
 
-TRITON = 'Triton'
-HELIOS2 = 'Helios2'
-
-'''
-PREPARATION
-'''
-def create_devices_with_tries():
-    '''
-    This function waits for the user to connect a device before raising
-        an exception
-    '''
-    tries = 0
-    tries_max = 6
-    sleep_time_secs = 10
-    while tries < tries_max:  # Wait for device for 60 seconds
-        devices = system.create_device()
-        if not devices:
-            print(
-                f'{TAB1}Try {tries+1} of {tries_max}: waiting for {sleep_time_secs} '
-                f'secs for a device to be connected!')
-            for sec_count in range(sleep_time_secs):
-                time.sleep(1)
-                print(f'{TAB1}{sec_count + 1 } seconds passed ',
-                    '.' * sec_count, end='\r')
-            tries += 1
-        else:
-            print(f'{TAB1}Created {len(devices)} device(s)')
-            return devices
-    else:
-        raise Exception(f'{TAB1}No device found! Please connect a device and run '
-                        f'the example again.')
-
-
-def is_applicable_device_triton(device):
-    '''
-    Return True if a device is a Triton camera, False otherwise
-    '''
-    model_name = device.nodemap.get_node('DeviceModelName').value
-    return "TRI" in model_name and "-C" in model_name
-
-
-def is_applicable_device_helios2(device):
-    '''
-    Return True if a device is a Helios2 camera, False otherwise
-    '''
-    model_name = device.nodemap.get_node('DeviceModelName').value
-    return "HLT" in model_name or "HT" in model_name 
-
-
-def get_applicable_devices(devices, type):
-    '''
-    Return a list of applicable Triton devices
-    '''
-    applicable_devices = []
-
-    for device in devices:
-        if type == TRITON and is_applicable_device_triton(device):
-            applicable_devices.append(device)
-        elif type == HELIOS2 and is_applicable_device_helios2(device):
-            applicable_devices.append(device)
-    
-    if not len(applicable_devices):
-        raise Exception(f'{TAB1}No applicable device found! Please connect an Triton and Helios2 device and run '
-                        f'the example again.')
-
-    print(f'{TAB1}Detected {len(applicable_devices)} applicable {type} device(s)')
-    return applicable_devices
-
-'''
-HELPERS
-'''
-def convert_buffer_to_Coord3D_ABCY16(buffer):
-    '''
-    Convert to Coord3DD_ABCY16 format
-    '''
-    if buffer.pixel_format == enums.PixelFormat.Coord3D_ABCY16:
-        return buffer
-    print(f'{TAB1}Converting image buffer pixel format to Coord3D_ABCY16')
-    return BufferFactory.convert(buffer, enums.PixelFormat.Coord3D_ABCY16)
-
 def get_image_HLT(device):
-    '''
-    Returns intensity and xyz images from a Helios2 device
-    '''
-    # Set device stream nodemap --------------------------------------------
-    tl_stream_nodemap = device.tl_stream_nodemap
-    # Enable stream auto negotiate packet size
-    tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-    # Enable stream packet resend
-    tl_stream_nodemap['StreamPacketResendEnable'].value = True
 
-    # Set nodes --------------------------------------------------------------
-    # - pixelformat to Coord3D_ABCY16
-    # - 3D operating mode
+    # Configure stream and pixel format with auto-restore --------------------
     nodemap = device.nodemap
-    nodemap.get_node('PixelFormat').value = PixelFormat.Coord3D_ABCY16
+    with CameraOverrides(
+        device,
+        nodes={'PixelFormat': PixelFormat.Coord3D_ABCY16},
+        stream_nodes={
+            'StreamAutoNegotiatePacketSize': True,
+            'StreamPacketResendEnable': True,
+        },
+        strict=False,
+    ):
 
     # Get node values ---------------------------------------------------------
     # Read the scale factor and offsets to convert from unsigned 16-bit values 
@@ -172,24 +72,21 @@ def get_image_HLT(device):
     # get the coordinate scale in order to convert x, y and z values to millimeters as
     # well as the offset for x and y to correctly adjust values when in an
     # unsigned pixel format
-    print(f'{TAB1}Get xyz coordinate scales and offsets from nodemap')
-    xyz_scale_mm = nodemap["Scan3dCoordinateScale"].value # Coordinate scale to convert x, y, and z values to mm
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateA"
-    x_offset_mm = nodemap["Scan3dCoordinateOffset"].value # offset for x to adjust values when in unsigned pixel format
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateB"
-    y_offset_mm = nodemap["Scan3dCoordinateOffset"].value # offset for y
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateC"
-    z_offset_mm = nodemap["Scan3dCoordinateOffset"].value # offset for z
+        print(f'{TAB1}Get xyz coordinate scales and offsets from nodemap')
+        xyz_scale_mm = nodemap["Scan3dCoordinateScale"].value # Coordinate scale to convert x, y, and z values to mm
+        nodemap["Scan3dCoordinateSelector"].value = "CoordinateA"
+        x_offset_mm = nodemap["Scan3dCoordinateOffset"].value # offset for x to adjust values when in unsigned pixel format
+        nodemap["Scan3dCoordinateSelector"].value = "CoordinateB"
+        y_offset_mm = nodemap["Scan3dCoordinateOffset"].value # offset for y
+        nodemap["Scan3dCoordinateSelector"].value = "CoordinateC"
+        z_offset_mm = nodemap["Scan3dCoordinateOffset"].value # offset for z
 
 
-    # Start stream and get image
-    device.start_stream()
-    buffer = device.get_buffer()
+        device.start_stream()
+        buffer = device.get_buffer()
 
-    # Copy image buffer into the Coord3d_ABCY16 format
     buffer_Coord3D_ABCY16 = convert_buffer_to_Coord3D_ABCY16(buffer)
 
-    # get height and width
     height = int(buffer_Coord3D_ABCY16.height)
     width = int(buffer_Coord3D_ABCY16.width)
     channels_per_pixel = int(buffer_Coord3D_ABCY16.bits_per_pixel / 16)
@@ -227,20 +124,11 @@ def get_image_HLT(device):
             i += channels_per_pixel
 
 
-    # Stop stream
-    device.requeue_buffer(buffer)
-    device.stop_stream()
+        # Stop stream
+        device.requeue_buffer(buffer)
+        device.stop_stream()
 
     return intensity_image, xyz_mm
-
-def convert_buffer_to_Mono8(buffer):
-    '''
-    Convert to Mono8 format
-    '''
-    if (buffer.pixel_format == enums.PixelFormat.Mono8):
-        return buffer
-    print(f'{TAB1}Converting image buffer pixel format to Mono8 ')
-    return BufferFactory.convert(buffer, enums.PixelFormat.Mono8)
 
 
 def get_image_TRI(device):
@@ -248,30 +136,29 @@ def get_image_TRI(device):
     Returns image from a Triton device
     '''
 
-    # Set nodes --------------------------------------------------------------
-    # - pixelformat to RGB8
-    # - 3D operating mode
+    # Configure stream and pixel format with auto-restore --------------------
     nodemap = device.nodemap
-    nodemap.get_node('PixelFormat').value = PixelFormat.RGB8
+    with CameraOverrides(
+        device,
+        nodes={'PixelFormat': PixelFormat.RGB8},
+        stream_nodes={
+            'StreamAutoNegotiatePacketSize': True,
+            'StreamPacketResendEnable': True,
+        },
+        strict=False,
+    ):
 
-    # Set device stream nodemap --------------------------------------------
-    tl_stream_nodemap = device.tl_stream_nodemap
-    # Enable stream auto negotiate packet size
-    tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-    # Enable stream packet resend
-    tl_stream_nodemap['StreamPacketResendEnable'].value = True
+        # Get image ---------------------------------------------------
+        device.start_stream()
+        buffer = device.get_buffer()
+        buffer_Mono8 = convert_buffer_to_Mono8(buffer)
+        buffer_bytes_per_pixel = int(len(buffer_Mono8.data)/(buffer_Mono8.width * buffer_Mono8.height))
+        image_matrix = np.asarray(buffer_Mono8.data, dtype=np.uint8)
+        image_matrix_reshaped = image_matrix.reshape(buffer_Mono8.height, buffer_Mono8.width, buffer_bytes_per_pixel)
 
-    # Get image ---------------------------------------------------
-    device.start_stream()
-    buffer = device.get_buffer()
-    buffer_Mono8 = convert_buffer_to_Mono8(buffer)
-    buffer_bytes_per_pixel = int(len(buffer_Mono8.data)/(buffer_Mono8.width * buffer_Mono8.height))
-    image_matrix = np.asarray(buffer_Mono8.data, dtype=np.uint8)
-    image_matrix_reshaped = image_matrix.reshape(buffer_Mono8.height, buffer_Mono8.width, buffer_bytes_per_pixel)
-
-    # Stop stream -------------------------------------------------
-    device.requeue_buffer(buffer)
-    device.stop_stream()
+        # Stop stream -------------------------------------------------
+        device.requeue_buffer(buffer)
+        device.stop_stream()
 
     return image_matrix_reshaped
 
@@ -356,18 +243,9 @@ EXAMPLE
 '''
 def calculate_and_save_orientation_values(device_triton, device_helios2):
     
-    # Get node values that will be changed in order to return their values at the end of the example ----------------------------------------------------------------
-    nodemap_triton = device_triton.nodemap
-    nodemap_helios2 = device_helios2.nodemap
-    pixel_format_initial_triton = nodemap_triton.get_node("PixelFormat").value
-    pixel_format_initial_helios2 = nodemap_helios2.get_node("PixelFormat").value
-    
     # Read in camera matrix and distance coefficient ----------------------------------------------------------------
     print(f'{TAB1}Read camera matrix and distance coefficients from file {FILE_NAME_IN}')
-    fs = cv2.FileStorage(FILE_NAME_IN, cv2.FileStorage_READ)
-    camera_matrix = fs.getNode('cameraMatrix').mat()
-    dist_coeffs = fs.getNode('distCoeffs').mat()
-    fs.release()
+    camera_matrix, dist_coeffs = read_calibration(FILE_NAME_IN)
 
     # Get an image from Helios2 ----------------------------------------------------------------
     print(f'{TAB1}Get and prepare HLT image')
@@ -436,16 +314,8 @@ def calculate_and_save_orientation_values(device_triton, device_helios2):
 
     # Save orientation information ----------------------------------------------------------------
     print(f'{TAB1}Save camera matrix, distance coefficients, and rotation and translation vectors to file {FILE_NAME_OUT}')
-    fs = cv2.FileStorage(FILE_NAME_OUT, cv2.FileStorage_WRITE)
-    fs.write('cameraMatrix', camera_matrix)
-    fs.write('distCoeffs', dist_coeffs)
-    fs.write('rotationVector', rotation_vector)
-    fs.write('translationVector', translation_vector)
-    fs.release()
+    write_orientation(FILE_NAME_OUT, camera_matrix, dist_coeffs, rotation_vector, translation_vector)
 
-    # Return nodes to their original values ----------------------------------------------------------------
-    nodemap_triton.get_node("PixelFormat").value = pixel_format_initial_triton
-    nodemap_helios2.get_node("PixelFormat").value = pixel_format_initial_helios2
 
 
 def example_entry_point():

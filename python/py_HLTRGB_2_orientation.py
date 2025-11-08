@@ -1,16 +1,3 @@
-# -----------------------------------------------------------------------------
-# Copyright (c) 2024, Lucid Vision Labs, Inc.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
-# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
-# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
-# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-# -----------------------------------------------------------------------------
-
 import time
 import ctypes
 from os.path import exists
@@ -28,118 +15,22 @@ from arena_api import enums
 from arena_api.system import system
 from arena_api.buffer import BufferFactory
 from arena_api.enums import PixelFormat
-'''
-Helios RGB: Orientation
-    This example is part 2 of a 3-part example on color overlay over 3D images.
-    Color data can be overlaid over 3D images by reading the 
-    3D points ABC (XYZ) from the Helios and projecting them onto
-    the Triton color (RGB) camera directly. This requires first solving for the
-    orientation of the Helios coordinate system relative to the Triton’s
-    native coordinate space (rotation and translation wise). This step can be
-    achieved by using the open function solvePnP(). Solving for orientation of
-    the Helios relative to the Triton requires a single image of the
-    calibration target from each camera. Place the calibration target near the
-    center of both cameras field of view and at an appropriate distance from
-    the cameras. Make sure the calibration target is placed at the same
-    distance you will be imaging in your application. Make sure not to move the
-    calibration target or cameras in between grabbing the Helios image and
-    grabbing the Triton image.
-'''
+from common.lucid_vision import (
+    TRITON, HELIOS2, TAB1, TAB2,
+    create_devices_with_tries,
+    get_applicable_devices,
+    convert_buffer_to_Coord3D_ABCY16,
+    convert_buffer_to_Mono8,
+    extract_triton_mono8,
+    read_calibration,
+    write_orientation,
+)
+from common.node_overrides import CameraOverrides, safe_set_node, safe_get_node_value
 
-'''
-Settings
-'''
-TAB1 = "  "
-TAB2 = "    "
-
-# image timeout
 TIMEOUT = 2000
-
-# calibration values file name
 FILE_NAME_IN = 'tritoncalibration.yml'
-
-# orientation values file name
 FILE_NAME_OUT = "orientation.yml"
 
-TRITON = 'Triton'
-HELIOS2 = 'Helios2'
-
-'''
-PREPARATION
-'''
-def create_devices_with_tries():
-    '''
-    This function waits for the user to connect a device before raising
-        an exception
-    '''
-    tries = 0
-    tries_max = 6
-    sleep_time_secs = 10
-    while tries < tries_max:  # Wait for device for 60 seconds
-        devices = system.create_device()
-        if not devices:
-            print(
-                f'{TAB1}Try {tries+1} of {tries_max}: waiting for {sleep_time_secs} '
-                f'secs for a device to be connected!')
-            for sec_count in range(sleep_time_secs):
-                time.sleep(1)
-                print(f'{TAB1}{sec_count + 1 } seconds passed ',
-                    '.' * sec_count, end='\r')
-            tries += 1
-        else:
-            print(f'{TAB1}Created {len(devices)} device(s)')
-            return devices
-    else:
-        raise Exception(f'{TAB1}No device found! Please connect a device and run '
-                        f'the example again.')
-
-
-def is_applicable_device_triton(device):
-    '''
-    Return True if a device is a Triton camera, False otherwise
-    '''
-    model_name = device.nodemap.get_node('DeviceModelName').value
-    return "TRI" in model_name and "-C" in model_name
-
-
-def is_applicable_device_helios2(device):
-    '''
-    Return True if a device is a Helios2 camera, False otherwise
-    '''
-    model_name = device.nodemap.get_node('DeviceModelName').value
-    return "HLT" in model_name or "HTP" in model_name or "HTW" in model_name
-
-
-def get_applicable_devices(devices, type):
-    '''
-    Return a list of applicable Triton devices
-    '''
-    applicable_devices = []
-
-    for device in devices:
-        if type == TRITON and is_applicable_device_triton(device):
-            applicable_devices.append(device)
-        elif type == HELIOS2 and is_applicable_device_helios2(device):
-            applicable_devices.append(device)
-    
-    if not len(applicable_devices):
-        raise Exception(f'{TAB1}No applicable device found! Please connect an Triton and Helios2 device and run '
-                        f'the example again.')
-
-    print(f'{TAB1}Detected {len(applicable_devices)} applicable {type} device(s)')
-    return applicable_devices
-
-'''
-HELPERS
-'''
-def convert_buffer_to_Coord3D_ABCY16(buffer):
-    '''
-    Convert to Coord3DD_ABCY16 format
-    '''
-    if buffer.pixel_format == enums.PixelFormat.Coord3D_ABCY16:
-        return buffer
-    print(f'{TAB1}Converting image buffer pixel format to Coord3D_ABCY16')
-    return BufferFactory.convert(buffer, enums.PixelFormat.Coord3D_ABCY16)
 
 def configure_helios_for_calibration(device):
     '''
@@ -147,11 +38,11 @@ def configure_helios_for_calibration(device):
     Returns: (xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm, saved_settings_dict)
     '''
     tl_stream_nodemap = device.tl_stream_nodemap
-    tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-    tl_stream_nodemap['StreamPacketResendEnable'].value = True
+    safe_set_node(tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', True)
+    safe_set_node(tl_stream_nodemap, 'StreamPacketResendEnable', True)
 
     nodemap = device.nodemap
-    nodemap.get_node('PixelFormat').value = PixelFormat.Coord3D_ABCY16
+    safe_set_node(nodemap, 'PixelFormat', PixelFormat.Coord3D_ABCY16)
     
     # Save original settings to restore later
 
@@ -160,51 +51,47 @@ def configure_helios_for_calibration(device):
     print(f'{TAB1}Configuring Helios for calibration (aggressive settings)...')
     
     # 1. Maximize exposure time for better depth on white surfaces
-    try:
-        node = nodemap.get_node('ExposureTimeSelector')
-        saved_settings['ExposureTimeSelector'] = node.value
-        node.value = "Exp250Us"
-        print(f'{TAB1}  ExposureTimeSelector: {saved_settings["ExposureTimeSelector"]} -> Exp250Us')
-    except Exception:
-        print(f'{TAB1}  Info: Could not set exposure time ({Exception})')
+    orig_exposure_sel = safe_get_node_value(nodemap, 'ExposureTimeSelector', None)
+    if safe_set_node(nodemap, 'ExposureTimeSelector', 'Exp250Us'):
+        if orig_exposure_sel is not None:
+            saved_settings['ExposureTimeSelector'] = orig_exposure_sel
+        print(f'{TAB1}  ExposureTimeSelector: {orig_exposure_sel} -> Exp250Us')
+    else:
+        print(f'{TAB1}  Info: Could not set exposure time')
 
     # 3. Lower confidence threshold to accept more pixels
-    try:
-        node = nodemap.get_node('Scan3dConfidenceThreshold')
-        saved_settings['Scan3dConfidenceThreshold'] = node.value
-        # Lower threshold = accept lower quality depth data
-        node.value = max(node.min, 50.0)  # Try 50 or minimum
-        print(f'{TAB1}  Scan3dConfidenceThreshold: {saved_settings["Scan3dConfidenceThreshold"]:.0f} -> {node.value:.0f}')
-    except Exception as e:
+    orig_conf = safe_get_node_value(nodemap, 'Scan3dConfidenceThreshold', None)
+    conf_new = 50.0
+    if safe_set_node(nodemap, 'Scan3dConfidenceThreshold', conf_new):
+        if orig_conf is not None:
+            saved_settings['Scan3dConfidenceThreshold'] = orig_conf
+        print(f'{TAB1}  Scan3dConfidenceThreshold: {orig_conf} -> {conf_new}')
+    else:
         print(f'{TAB1}  Info: Scan3dConfidenceThreshold not available')
     
     # 4. Increase accumulation/averaging if available
-    try:
-        node = nodemap.get_node('Scan3dImageAccumulation')
-        saved_settings['Scan3dImageAccumulation'] = node.value
-        node.value = min(node.max, 4)  # Average up to 4 frames
-        print(f'{TAB1}  Scan3dImageAccumulation: {saved_settings["Scan3dImageAccumulation"]:.0f} -> {node.value:.0f}')
-    except Exception as e:
-        pass
+    orig_accum = safe_get_node_value(nodemap, 'Scan3dImageAccumulation', None)
+    accum_new = 4
+    if safe_set_node(nodemap, 'Scan3dImageAccumulation', accum_new):
+        if orig_accum is not None:
+            saved_settings['Scan3dImageAccumulation'] = orig_accum
+        print(f'{TAB1}  Scan3dImageAccumulation: {orig_accum} -> {accum_new}')
     
     # 5. Disable any filtering that might reject valid pixels
-    try:
-        node = nodemap.get_node('Scan3dSpatialFilter')
-        saved_settings['Scan3dSpatialFilter'] = node.value
-        if hasattr(node, 'is_writable') and node.is_writable:
-            node.value = False
-            print(f'{TAB1}  Scan3dSpatialFilter: {saved_settings["Scan3dSpatialFilter"]} -> False')
-    except Exception:
-        pass
+    orig_spatial = safe_get_node_value(nodemap, 'Scan3dSpatialFilter', None)
+    if safe_set_node(nodemap, 'Scan3dSpatialFilter', False):
+        if orig_spatial is not None:
+            saved_settings['Scan3dSpatialFilter'] = orig_spatial
+        print(f'{TAB1}  Scan3dSpatialFilter: {orig_spatial} -> False')
 
     print(f'{TAB1}Get xyz coordinate scales and offsets from nodemap')
-    xyz_scale_mm = nodemap["Scan3dCoordinateScale"].value
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateA"
-    x_offset_mm = nodemap["Scan3dCoordinateOffset"].value
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateB"
-    y_offset_mm = nodemap["Scan3dCoordinateOffset"].value
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateC"
-    z_offset_mm = nodemap["Scan3dCoordinateOffset"].value
+    xyz_scale_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateScale', None)
+    safe_set_node(nodemap, 'Scan3dCoordinateSelector', 'CoordinateA')
+    x_offset_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateOffset', None)
+    safe_set_node(nodemap, 'Scan3dCoordinateSelector', 'CoordinateB')
+    y_offset_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateOffset', None)
+    safe_set_node(nodemap, 'Scan3dCoordinateSelector', 'CoordinateC')
+    z_offset_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateOffset', None)
 
     return xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm, saved_settings
 
@@ -220,12 +107,10 @@ def restore_helios_settings(device, saved_settings):
     print(f'{TAB1}Restoring Helios to original settings...')
     
     for param_name, original_value in saved_settings.items():
-        try:
-            node = nodemap.get_node(param_name)
-            node.value = original_value
+        if safe_set_node(nodemap, param_name, original_value):
             print(f'{TAB1}  {param_name}: restored to {original_value}')
-        except Exception as e:
-            print(f'{TAB1}  Warning: Could not restore {param_name}: {e}')
+        else:
+            print(f'{TAB1}  Warning: Could not restore {param_name}')
 
 
 def extract_helios_xyz_intensity(buffer, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm):
@@ -287,14 +172,7 @@ def get_image_HLT(device):
 
     return intensity_image, xyz_mm
 
-def convert_buffer_to_Mono8(buffer):
-    '''
-    Convert to Mono8 format
-    '''
-    if (buffer.pixel_format == enums.PixelFormat.Mono8):
-        return buffer
-    print(f'{TAB1}Converting image buffer pixel format to Mono8 ')
-    return BufferFactory.convert(buffer, enums.PixelFormat.Mono8)
+ 
 
 
 def get_image_TRI(device):
@@ -321,15 +199,7 @@ def configure_triton_for_capture(device):
     nodemap = device.nodemap
     # Ensure parameters are writable and ROI is valid before resizing
     # Unlock if supported
-    try:
-        tl_lock = nodemap.get_node('TLParamsLocked')
-        try:
-            tl_lock.value = 0
-        except Exception:
-            # Some firmware exposes it as boolean/enum, ignore if not applicable
-            pass
-    except Exception:
-        pass
+    safe_set_node(nodemap, 'TLParamsLocked', 0)
 
     # Reset binning/decimation to avoid alignment issues when expanding ROI
     for node_name, value in (
@@ -339,17 +209,11 @@ def configure_triton_for_capture(device):
         ('DecimationHorizontal', 1),
         ('DecimationVertical', 1),
     ):
-        try:
-            nodemap.get_node(node_name).value = value
-        except Exception:
-            pass
+        safe_set_node(nodemap, node_name, value)
 
     # Reset offsets to origin so width/height can be maximized safely
     for node_name in ('OffsetX', 'OffsetY'):
-        try:
-            nodemap.get_node(node_name).value = 0
-        except Exception:
-            pass
+        safe_set_node(nodemap, node_name, 0)
 
     # Helper to align to node constraints
     def _align_to_node(node, desired):
@@ -377,54 +241,42 @@ def configure_triton_for_capture(device):
         h = _align_to_node(height_node, desired_h)
         # Some devices require height before width; try height first
         try:
-            height_node.value = h
-            width_node.value = w
+            # Prefer safe_set_node for consistency
+            set1 = safe_set_node(nodemap, 'Height', h) and safe_set_node(nodemap, 'Width', w)
+            if not set1:
+                # Fallback to direct if wrappers fail silently
+                height_node.value = h
+                width_node.value = w
         except Exception:
             # Try the opposite order
-            width_node.value = w
-            height_node.value = h
+            set2 = safe_set_node(nodemap, 'Width', w) and safe_set_node(nodemap, 'Height', h)
+            if not set2:
+                width_node.value = w
+                height_node.value = h
     except Exception as e:
         print(f"{TAB1}Warning: Could not set Triton ROI to 2048x1536: {e}")
 
     # Prefer RGB8 for easier processing downstream (we convert to Mono8 later)
-    try:
-        nodemap.get_node('PixelFormat').value = PixelFormat.RGB8
-    except Exception as e:
-        print(f"{TAB1}Warning: Could not set PixelFormat RGB8: {e}")
+    if not safe_set_node(nodemap, 'PixelFormat', PixelFormat.RGB8):
+        print(f"{TAB1}Warning: Could not set PixelFormat RGB8")
     
     # Add exposure control to prevent IR overexposure from Helios
-    try:
-        nodemap.get_node('ExposureAuto').value = 'Off'
-        nodemap.get_node('ExposureTime').value = 250 # 15ms - increased for better brightness
+    if safe_set_node(nodemap, 'ExposureAuto', 'Off') and safe_set_node(nodemap, 'ExposureTime', 250):
         print(f'{TAB1}Set Triton exposure to 250 us (manual)')
-    except Exception as e:
-        print(f'{TAB1}Warning: Could not set Triton exposure: {e}')
+    else:
+        print(f'{TAB1}Warning: Could not set Triton exposure')
     
     # Add gain to brighten the image
-    try:
-        nodemap.get_node('GainAuto').value = 'Off'
-        nodemap.get_node('Gain').value = 6.0  # 6dB gain for brighter circles
+    if safe_set_node(nodemap, 'GainAuto', 'Off') and safe_set_node(nodemap, 'Gain', 6.0):
         print(f'{TAB1}Set Triton gain to 6.0 dB')
-    except Exception:
-        pass
 
     tl_stream_nodemap = device.tl_stream_nodemap
-    tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-    tl_stream_nodemap['StreamPacketResendEnable'].value = True
-    try:
-        tl_stream_nodemap['StreamBufferHandlingMode'].value = 'NewestOnly'
-    except Exception:
-        pass
+    safe_set_node(tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', True)
+    safe_set_node(tl_stream_nodemap, 'StreamPacketResendEnable', True)
+    safe_set_node(tl_stream_nodemap, 'StreamBufferHandlingMode', 'NewestOnly')
 
 
-def extract_triton_mono8(buffer):
-    '''
-    Convert a Triton RGB buffer into a Mono8 numpy array.
-    '''
-    buffer_Mono8 = convert_buffer_to_Mono8(buffer)
-    image_matrix = np.asarray(buffer_Mono8.data, dtype=np.uint8)
-    image_matrix_reshaped = image_matrix.reshape(buffer_Mono8.height, buffer_Mono8.width)
-    return image_matrix_reshaped
+ 
 
 
 def capture_synced_frames(device_triton, device_helios2):
@@ -433,55 +285,76 @@ def capture_synced_frames(device_triton, device_helios2):
     CRITICAL: Capture Triton FIRST to avoid IR contamination from Helios projector.
     Returns: (intensity_image, xyz_mm, image_matrix_TRI, helios_saved_settings)
     '''
-    # Configure with aggressive calibration-optimized settings
-    xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm, helios_saved_settings = configure_helios_for_calibration(device_helios2)
-    configure_triton_for_capture(device_triton)
+    with CameraOverrides(
+        device_triton,
+        nodes={k: v for k, v in {
+            'PixelFormat': safe_get_node_value(device_triton.nodemap, 'PixelFormat', None),
+        }.items() if v is not None},
+        stream_nodes={k: v for k, v in {
+            'StreamAutoNegotiatePacketSize': safe_get_node_value(device_triton.tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', None),
+            'StreamPacketResendEnable': safe_get_node_value(device_triton.tl_stream_nodemap, 'StreamPacketResendEnable', None),
+            'StreamBufferHandlingMode': safe_get_node_value(device_triton.tl_stream_nodemap, 'StreamBufferHandlingMode', None),
+        }.items() if v is not None}
+    ), CameraOverrides(
+        device_helios2,
+        nodes={k: v for k, v in {
+            'PixelFormat': safe_get_node_value(device_helios2.nodemap, 'PixelFormat', None),
+        }.items() if v is not None},
+        stream_nodes={k: v for k, v in {
+            'StreamAutoNegotiatePacketSize': safe_get_node_value(device_helios2.tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', None),
+            'StreamPacketResendEnable': safe_get_node_value(device_helios2.tl_stream_nodemap, 'StreamPacketResendEnable', None),
+            'StreamBufferHandlingMode': safe_get_node_value(device_helios2.tl_stream_nodemap, 'StreamBufferHandlingMode', None),
+        }.items() if v is not None}
+    ):
+        # Configure with aggressive calibration-optimized settings
+        xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm, helios_saved_settings = configure_helios_for_calibration(device_helios2)
+        configure_triton_for_capture(device_triton)
 
-    buffer_h = None
-    buffer_t = None
-
-    # Start Triton FIRST and let it stabilize
-    device_triton.start_stream()
-    
-    try:
-        # Warm-up Triton first (2-3 frames to stabilize exposure)
-        print(f'{TAB1}Warming up Triton camera...')
-        for _ in range(3):
-            tmp = device_triton.get_buffer()
-            device_triton.requeue_buffer(tmp)
-            time.sleep(0.1)  # Let exposure stabilize
-        
-        # Capture Triton frame BEFORE starting Helios (avoids IR contamination)
-        print(f'{TAB1}Capturing Triton frame (before Helios IR)...')
-        buffer_t = device_triton.get_buffer()
-        image_matrix_TRI = extract_triton_mono8(buffer_t)
-        device_triton.requeue_buffer(buffer_t)
+        buffer_h = None
         buffer_t = None
-        
-        # Stop Triton now that we have clean RGB data
-        device_triton.stop_stream()
-        
-        # NOW start Helios and capture depth (IR won't affect Triton anymore)
-        print(f'{TAB1}Capturing Helios frame...')
-        device_helios2.start_stream()
-        
-        # Warm-up Helios
-        for _ in range(2):
-            tmp = device_helios2.get_buffer()
-            device_helios2.requeue_buffer(tmp)
 
-        buffer_h = device_helios2.get_buffer()
-        intensity_image, xyz_mm = extract_helios_xyz_intensity(buffer_h, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm)
+        # Start Triton FIRST and let it stabilize
+        device_triton.start_stream()
         
-    finally:
-        if buffer_h is not None:
-            device_helios2.requeue_buffer(buffer_h)
-        if buffer_t is not None:
+        try:
+            # Warm-up Triton first (2-3 frames to stabilize exposure)
+            print(f'{TAB1}Warming up Triton camera...')
+            for _ in range(3):
+                tmp = device_triton.get_buffer()
+                device_triton.requeue_buffer(tmp)
+                time.sleep(0.1)  # Let exposure stabilize
+            
+            # Capture Triton frame BEFORE starting Helios (avoids IR contamination)
+            print(f'{TAB1}Capturing Triton frame (before Helios IR)...')
+            buffer_t = device_triton.get_buffer()
+            image_matrix_TRI = extract_triton_mono8(buffer_t)
             device_triton.requeue_buffer(buffer_t)
-        device_helios2.stop_stream()
-        # Triton already stopped above
+            buffer_t = None
+            
+            # Stop Triton now that we have clean RGB data
+            device_triton.stop_stream()
+            
+            # NOW start Helios and capture depth (IR won't affect Triton anymore)
+            print(f'{TAB1}Capturing Helios frame...')
+            device_helios2.start_stream()
+            
+            # Warm-up Helios
+            for _ in range(2):
+                tmp = device_helios2.get_buffer()
+                device_helios2.requeue_buffer(tmp)
 
-    return intensity_image, xyz_mm, image_matrix_TRI, helios_saved_settings
+            buffer_h = device_helios2.get_buffer()
+            intensity_image, xyz_mm = extract_helios_xyz_intensity(buffer_h, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm)
+            
+        finally:
+            if buffer_h is not None:
+                device_helios2.requeue_buffer(buffer_h)
+            if buffer_t is not None:
+                device_triton.requeue_buffer(buffer_t)
+            device_helios2.stop_stream()
+            # Triton already stopped above
+
+        return intensity_image, xyz_mm, image_matrix_TRI, helios_saved_settings
 
 def find_calibration_points_HLT(image_in_orig):
     '''
@@ -631,18 +504,9 @@ EXAMPLE
 '''
 def calculate_and_save_orientation_values(device_triton, device_helios2):
     
-    # Get node values that will be changed in order to return their values at the end of the example ----------------------------------------------------------------
-    nodemap_triton = device_triton.nodemap
-    nodemap_helios2 = device_helios2.nodemap
-    pixel_format_initial_triton = nodemap_triton.get_node("PixelFormat").value
-    pixel_format_initial_helios2 = nodemap_helios2.get_node("PixelFormat").value
-    
     # Read in camera matrix and distance coefficient ----------------------------------------------------------------
     print(f'{TAB1}Read camera matrix and distance coefficients from file {FILE_NAME_IN}')
-    fs = cv2.FileStorage(FILE_NAME_IN, cv2.FileStorage_READ)
-    camera_matrix = fs.getNode('cameraMatrix').mat()
-    dist_coeffs = fs.getNode('distCoeffs').mat()
-    fs.release()
+    camera_matrix, dist_coeffs = read_calibration(FILE_NAME_IN)
 
     # Capture a synchronized pair of frames ---------------------------------------------------
     print(f'{TAB1}Capture synchronized frames from both cameras')
@@ -955,22 +819,15 @@ def calculate_and_save_orientation_values(device_triton, device_helios2):
 
     # Save orientation information ----------------------------------------------------------------
     print(f'{TAB1}Save camera matrix, distance coefficients, and rotation and translation vectors to file {FILE_NAME_OUT}')
-    fs = cv2.FileStorage(FILE_NAME_OUT, cv2.FileStorage_WRITE)
-    fs.write('cameraMatrix', camera_matrix)
-    fs.write('distCoeffs', dist_coeffs)
-    fs.write('rotationVector', rotation_vector)
-    fs.write('translationVector', translation_vector)
-    fs.release()
+    # Persist calibration image size for robust intrinsic scaling in live overlay
+    tri_h, tri_w = image_matrix_TRI.shape[:2]
+    write_orientation(FILE_NAME_OUT, camera_matrix, dist_coeffs, rotation_vector, translation_vector, image_size=(tri_w, tri_h))
 
     # Keep preview windows open for inspection
     print(f'\n{TAB1}All preview windows left open for inspection.')
     
     # Restore Helios to normal operating settings ----------------------------------------------------------------
     restore_helios_settings(device_helios2, helios_saved_settings)
-    
-    # Return nodes to their original values ----------------------------------------------------------------
-    nodemap_triton.get_node("PixelFormat").value = pixel_format_initial_triton
-    nodemap_helios2.get_node("PixelFormat").value = pixel_format_initial_helios2
 
 
 def example_entry_point():

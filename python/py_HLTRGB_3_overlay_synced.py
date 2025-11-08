@@ -9,106 +9,44 @@ from arena_api import enums
 from arena_api.system import system
 from arena_api.buffer import BufferFactory
 from arena_api.enums import PixelFormat
-
-
-# Formatting helpers
-TAB1 = "  "
-TAB2 = "    "
+from common.lucid_vision import (
+    TRITON,TAB1,TAB2,HELIOS2,
+    create_devices_with_tries,
+    get_applicable_devices,
+    convert_buffer_to_Coord3D_ABCY16,
+    read_orientation,
+)
+from common.node_overrides import CameraOverrides, safe_set_node, safe_get_node_value
 
 # Calibration/orientation file
 ORIENTATION_FILE = 'orientation.yml'
 
-# Device designators
-TRITON = 'Triton'
-HELIOS2 = 'Helios2'
-
-# Depth heatmap fixed color scale (mm)
 DEPTH_COLOR_MIN_MM = 300.0
-
 DEPTH_COLOR_MAX_MM = 1550.0
 
-'''
-Device helpers
-'''
-def create_devices_with_tries():
-    tries = 0
-    tries_max = 6
-    sleep_time_secs = 10
-    while tries < tries_max:
-        devices = system.create_device()
-        if not devices:
-            print(f'{TAB1}Try {tries+1} of {tries_max}: waiting for {sleep_time_secs} secs for a device to be connected!')
-            for sec_count in range(sleep_time_secs):
-                time.sleep(1)
-                print(f'{TAB1}{sec_count + 1 } seconds passed ', '.' * sec_count, end='\r')
-            tries += 1
-        else:
-            print(f'{TAB1}Created {len(devices)} device(s)')
-            return devices
-    raise Exception(f'{TAB1}No device found! Please connect a device and run the example again.')
 
-
-def is_applicable_device_triton(device):
-    model_name = device.nodemap.get_node('DeviceModelName').value
-    return "TRI" in model_name and "-C" in model_name
-
-
-def is_applicable_device_helios2(device):
-    model_name = device.nodemap.get_node('DeviceModelName').value
-    return "HLT" in model_name or "HTP" in model_name or "HTW" in model_name
-
-
-def get_applicable_devices(devices, type_label):
-    applicable_devices = []
-    for device in devices:
-        if type_label == TRITON and is_applicable_device_triton(device):
-            applicable_devices.append(device)
-        elif type_label == HELIOS2 and is_applicable_device_helios2(device):
-            applicable_devices.append(device)
-    if not applicable_devices:
-        raise Exception(f'{TAB1}No applicable device found! Please connect a Triton and Helios2 device and run the example again.')
-    print(f'{TAB1}Detected {len(applicable_devices)} applicable {type_label} device(s)')
-    return applicable_devices
-
-
-'''
-Streaming setup
-'''
 def enable_ptp(device, label):
     nm = device.nodemap
     enabled = False
     # Try PTP enable nodes used by different firmware variants
-    try:
-        nm.get_node('PtpEnable').value = True
+    if safe_set_node(nm, 'PtpEnable', True):
         enabled = True
-    except Exception:
-        pass
     if not enabled:
-        try:
-            nm.get_node('GevIEEE1588').value = True
+        if safe_set_node(nm, 'GevIEEE1588', True):
             enabled = True
-        except Exception:
-            pass
     # Auto role if available
     for node_name, auto_value in (
         ('PtpRole', 'Auto'),
         ('GevIEEE1588ClockControl', 'Auto'),
     ):
-        try:
-            nm.get_node(node_name).value = auto_value
-        except Exception:
-            pass
+        safe_set_node(nm, node_name, auto_value)
     # Wait briefly for status to stabilize
     status = None
     start = time.perf_counter()
     while (time.perf_counter() - start) < 5.0:
-        try:
-            status = nm.get_node('PtpStatus').value
-        except Exception:
-            try:
-                status = nm.get_node('GevIEEE1588Status').value
-            except Exception:
-                status = None
+        status = safe_get_node_value(nm, 'PtpStatus', None)
+        if status is None:
+            status = safe_get_node_value(nm, 'GevIEEE1588Status', None)
         if status and (('Master' in status) or ('Slave' in status) or ('Locked' in status)):
             break
         time.sleep(0.2)
@@ -119,95 +57,54 @@ def setup_triton_for_stream(device_triton):
     nodemap = device_triton.nodemap
     # Prefer lower bandwidth: apply binning/decimation and Bayer format
     # Try binning first
-    try:
-        try:
-            nodemap.get_node('BinningSelector').value = 'All'
-        except Exception:
-            pass
-        nodemap.get_node('BinningHorizontal').value = 2
-        nodemap.get_node('BinningVertical').value = 2
-    except Exception:
+    safe_set_node(nodemap, 'BinningSelector', 'All')
+    bh_ok = safe_set_node(nodemap, 'BinningHorizontal', 2)
+    bv_ok = safe_set_node(nodemap, 'BinningVertical', 2)
+    if not (bh_ok and bv_ok):
         # Fallback to decimation if binning not available
-        try:
-            nodemap.get_node('DecimationHorizontal').value = 2
-            nodemap.get_node('DecimationVertical').value = 2
-        except Exception:
-            pass
+        safe_set_node(nodemap, 'DecimationHorizontal', 2)
+        safe_set_node(nodemap, 'DecimationVertical', 2)
 
     # Use BayerRG8 (1 byte/pixel) to reduce bandwidth
-    try:
-        nodemap.get_node('PixelFormat').value = PixelFormat.BayerRG8
-    except Exception:
+    if not safe_set_node(nodemap, 'PixelFormat', PixelFormat.BayerRG8):
         # Fallback to RGB8 if Bayer not available
-        nodemap.get_node('PixelFormat').value = PixelFormat.RGB8
+        safe_set_node(nodemap, 'PixelFormat', PixelFormat.RGB8)
 
     # Disable link limit that caps frame rate based on bandwidth
-    try:
-        nodemap.get_node('AcquisitionFrameRateLinkLimitEnable').value = False
-    except Exception:
-        pass
+    safe_set_node(nodemap, 'AcquisitionFrameRateLinkLimitEnable', False)
     # Try multiple approaches to enable frame rate control
     fps_enabled = False
-    try:
-        nodemap.get_node('AcquisitionFrameRateEnable').value = True
+    if safe_set_node(nodemap, 'AcquisitionFrameRateEnable', True):
         fps_enabled = True
-    except Exception:
-        pass
     if not fps_enabled:
-        try:
-            nodemap.get_node('AcquisitionFrameRateEnabled').value = True
+        if safe_set_node(nodemap, 'AcquisitionFrameRateEnabled', True):
             fps_enabled = True
-        except Exception:
-            pass
     # Set target frame rate
-    try:
-        nodemap.get_node('AcquisitionFrameRate').value = 30.0
-    except Exception:
-        try:
-            nodemap.get_node('AcquisitionFrameRateAbs').value = 30.0
-        except Exception:
-            pass
+    if not safe_set_node(nodemap, 'AcquisitionFrameRate', 30.0):
+        safe_set_node(nodemap, 'AcquisitionFrameRateAbs', 30.0)
     tl_stream_nodemap = device_triton.tl_stream_nodemap
-    tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-    tl_stream_nodemap['StreamPacketResendEnable'].value = True
+    safe_set_node(tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', True)
+    safe_set_node(tl_stream_nodemap, 'StreamPacketResendEnable', True)
     # Prefer newest frame to reduce blocking latency
-    try:
-        tl_stream_nodemap['StreamBufferHandlingMode'].value = 'NewestOnly'
-    except Exception:
-        pass
+    safe_set_node(tl_stream_nodemap, 'StreamBufferHandlingMode', 'NewestOnly')
     # Use small buffer count to reduce latency
-    try:
-        tl_stream_nodemap['StreamBufferCountMode'].value = 'Manual'
-        tl_stream_nodemap['StreamBufferCount'].value = 4
-    except Exception:
-        pass
+    safe_set_node(tl_stream_nodemap, 'StreamBufferCountMode', 'Manual')
+    safe_set_node(tl_stream_nodemap, 'StreamBufferCount', 4)
 
     # Print a concise summary
-    try:
-        resulting_fps = nodemap.get_node('AcquisitionResultingFrameRate').value
-    except Exception:
-        resulting_fps = None
+    resulting_fps = safe_get_node_value(nodemap, 'AcquisitionResultingFrameRate', None)
     print(f"{TAB1}Triton configured: Bayer/Reduced res | Resulting FPS: {resulting_fps if resulting_fps else 'unknown'}")
 
 
 def setup_helios_for_stream(device_helios2):
     tl_stream_nodemap = device_helios2.tl_stream_nodemap
-    tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-    tl_stream_nodemap['StreamPacketResendEnable'].value = True
+    safe_set_node(tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', True)
+    safe_set_node(tl_stream_nodemap, 'StreamPacketResendEnable', True)
     nodemap = device_helios2.nodemap
-    nodemap.get_node('PixelFormat').value = PixelFormat.Coord3D_ABCY16
-    try:
-        nodemap.get_node('AcquisitionMode').value = 'Continuous'
-    except Exception:
-        pass
-    try:
-        nodemap.get_node('TriggerMode').value = 'Off'
-    except Exception:
-        pass
-    try:
-        tl_stream_nodemap['StreamBufferHandlingMode'].value = 'NewestOnly'
-    except Exception:
-        pass
+    safe_set_node(nodemap, 'PixelFormat', PixelFormat.Coord3D_ABCY16)
+    safe_set_node(nodemap, 'AcquisitionMode', 'Continuous')
+    safe_set_node(nodemap, 'TriggerMode', 'Off')
+    safe_set_node(tl_stream_nodemap, 'StreamBufferHandlingMode', 'NewestOnly')
 
 
 def convert_buffer_to_Coord3D_ABCY16(buffer):
@@ -216,9 +113,7 @@ def convert_buffer_to_Coord3D_ABCY16(buffer):
     return BufferFactory.convert(buffer, enums.PixelFormat.Coord3D_ABCY16)
 
 
-'''
-Frame acquisition (streaming)
-'''
+
 def acquire_triton_rgb_from_buffer(buffer):
     # Zero-copy view into buffer memory
     bytes_per_pixel = max(1, int(buffer.bits_per_pixel // 8))
@@ -260,18 +155,34 @@ Live overlay
 def live_overlay_synced(device_triton, device_helios2):
     # Load orientation
     print(f'{TAB1}Read orientation from {ORIENTATION_FILE}')
-    fs = cv2.FileStorage(ORIENTATION_FILE, cv2.FileStorage_READ)
-    camera_matrix = fs.getNode('cameraMatrix').mat()
-    dist_coeffs = fs.getNode('distCoeffs').mat()
-    rotation_vector = fs.getNode('rotationVector').mat()
-    translation_vector = fs.getNode('translationVector').mat()
-    fs.release()
+    camera_matrix, dist_coeffs, rotation_vector, translation_vector = read_orientation(ORIENTATION_FILE)
 
     # Precompute rotation matrix and cache projection components
     R, _ = cv2.Rodrigues(rotation_vector)
     t = translation_vector.reshape(3)
     K0 = camera_matrix.astype(np.float64)
     K = K0.copy()
+
+    # Try to read the calibration image size from the orientation file for robust scaling
+    calib_w = None
+    calib_h = None
+    try:
+        fs = cv2.FileStorage(ORIENTATION_FILE, cv2.FileStorage_READ)
+        if fs is not None:
+            try:
+                w_node = fs.getNode('calibratedImageWidth')
+                h_node = fs.getNode('calibratedImageHeight')
+                if w_node is not None and h_node is not None:
+                    w_val = int(w_node.real())
+                    h_val = int(h_node.real())
+                    if w_val > 0 and h_val > 0:
+                        calib_w = float(w_val)
+                        calib_h = float(h_val)
+            finally:
+                fs.release()
+    except Exception:
+        # Missing nodes are fine; fallback will be used below
+        pass
 
     def project_points_numpy(xyz):
         # xyz: (N,3)
@@ -292,48 +203,63 @@ def live_overlay_synced(device_triton, device_helios2):
         v = K[1, 1] * y_dist + K[1, 2]
         return np.stack((u, v), axis=1)
 
-    # Save original pixel formats to restore later
+    # Protect original pixel formats; other setup may change them
     nodemap_triton = device_triton.nodemap
     nodemap_helios2 = device_helios2.nodemap
-    pixel_format_initial_triton = nodemap_triton.get_node('PixelFormat').value
-    pixel_format_initial_helios2 = nodemap_helios2.get_node('PixelFormat').value
+    with CameraOverrides(
+        device_triton,
+        nodes={k: v for k, v in {
+            'PixelFormat': safe_get_node_value(nodemap_triton, 'PixelFormat', None),
+        }.items() if v is not None},
+        stream_nodes={k: v for k, v in {
+            'StreamAutoNegotiatePacketSize': safe_get_node_value(device_triton.tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', None),
+            'StreamPacketResendEnable': safe_get_node_value(device_triton.tl_stream_nodemap, 'StreamPacketResendEnable', None),
+            'StreamBufferHandlingMode': safe_get_node_value(device_triton.tl_stream_nodemap, 'StreamBufferHandlingMode', None),
+        }.items() if v is not None}
+    ), CameraOverrides(
+        device_helios2,
+        nodes={k: v for k, v in {
+            'PixelFormat': safe_get_node_value(nodemap_helios2, 'PixelFormat', None),
+        }.items() if v is not None},
+        stream_nodes={k: v for k, v in {
+            'StreamAutoNegotiatePacketSize': safe_get_node_value(device_helios2.tl_stream_nodemap, 'StreamAutoNegotiatePacketSize', None),
+            'StreamPacketResendEnable': safe_get_node_value(device_helios2.tl_stream_nodemap, 'StreamPacketResendEnable', None),
+            'StreamBufferHandlingMode': safe_get_node_value(device_helios2.tl_stream_nodemap, 'StreamBufferHandlingMode', None),
+        }.items() if v is not None}
+    ):
 
-    # Enable PTP on both devices and then configure streams
-    print(f'{TAB1}Configure streams and start both cameras')
-    triton_ptp = enable_ptp(device_triton, 'Triton')
-    helios_ptp = enable_ptp(device_helios2, 'Helios2')
-    if not (triton_ptp and helios_ptp):
-        raise Exception(f'{TAB1}Failed to enable PTP on both devices. Please verify network/PTP settings.')
-    setup_triton_for_stream(device_triton)
-    setup_helios_for_stream(device_helios2)
-    device_triton.start_stream()
-    device_helios2.start_stream()
+        # Enable PTP on both devices and then configure streams
+        print(f'{TAB1}Configure streams and start both cameras')
+        triton_ptp = enable_ptp(device_triton, 'Triton')
+        helios_ptp = enable_ptp(device_helios2, 'Helios2')
+        if not (triton_ptp and helios_ptp):
+            raise Exception(f'{TAB1}Failed to enable PTP on both devices. Please verify network/PTP settings.')
+        setup_triton_for_stream(device_triton)
+        setup_helios_for_stream(device_helios2)
+        device_triton.start_stream()
+        device_helios2.start_stream()
 
     # Cache Helios scale and offsets once (avoid nodemap reads per frame)
     nodemap = device_helios2.nodemap
-    xyz_scale_mm = nodemap["Scan3dCoordinateScale"].value
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateA"
-    x_offset_mm = nodemap["Scan3dCoordinateOffset"].value
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateB"
-    y_offset_mm = nodemap["Scan3dCoordinateOffset"].value
-    nodemap["Scan3dCoordinateSelector"].value = "CoordinateC"
-    z_offset_mm = nodemap["Scan3dCoordinateOffset"].value
+    xyz_scale_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateScale', None)
+    safe_set_node(nodemap, 'Scan3dCoordinateSelector', 'CoordinateA')
+    x_offset_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateOffset', None)
+    safe_set_node(nodemap, 'Scan3dCoordinateSelector', 'CoordinateB')
+    y_offset_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateOffset', None)
+    safe_set_node(nodemap, 'Scan3dCoordinateSelector', 'CoordinateC')
+    z_offset_mm = safe_get_node_value(nodemap, 'Scan3dCoordinateOffset', None)
 
     decimation = 1  # start with full resolution; press +/- to adjust at runtime
     window_name = 'RGB with Helios overlay (synced)'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # Projection matrix scaling for binned RGB
     k_scaled_applied = False
 
-    # Per-camera FPS tracking
     hlt_last_time = None
     tri_last_time = None
     hlt_fps = 0.0
     tri_fps = 0.0
 
-    # Prime latest frames to avoid blocking on both streams every loop
-    # Grab one frame from each stream up-front, then alternate per loop
     buf_h0 = device_helios2.get_buffer()
     init_intensity, init_xyz = acquire_helios_xyz_intensity_from_buffer(
         buf_h0, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm
@@ -358,7 +284,6 @@ def live_overlay_synced(device_triton, device_helios2):
     poll_helios_next = True
     last_wait_h_ms = 0.0
     last_wait_t_ms = 0.0
-
     try:
         while True:
             t0 = time.perf_counter()
@@ -416,9 +341,13 @@ def live_overlay_synced(device_triton, device_helios2):
             # Scale camera matrix once based on current RGB size vs calibration center-derived size
             if not k_scaled_applied:
                 rgb_h, rgb_w = rgb_image.shape[:2]
-                # Derive a baseline calibration size from principal point (assumes near-centered cx, cy)
-                base_w = max(1.0, 2.0 * float(K0[0, 2]))
-                base_h = max(1.0, 2.0 * float(K0[1, 2]))
+                # Prefer exact calibration size when available; otherwise estimate from principal point
+                if calib_w is not None and calib_h is not None:
+                    base_w = calib_w
+                    base_h = calib_h
+                else:
+                    base_w = max(1.0, 2.0 * float(K0[0, 2]))
+                    base_h = max(1.0, 2.0 * float(K0[1, 2]))
                 sx = float(rgb_w) / base_w
                 sy = float(rgb_h) / base_h
                 if abs(sx - 1.0) > 1e-3 or abs(sy - 1.0) > 1e-3:
@@ -599,11 +528,8 @@ def live_overlay_synced(device_triton, device_helios2):
 
             # Diagnostics removed
     finally:
-        # Stop streams and restore nodes
         device_triton.stop_stream()
         device_helios2.stop_stream()
-        nodemap_triton.get_node('PixelFormat').value = pixel_format_initial_triton
-        nodemap_helios2.get_node('PixelFormat').value = pixel_format_initial_helios2
         cv2.destroyAllWindows()
 
 
