@@ -332,43 +332,84 @@ def live_overlay_synced(device_triton, device_helios2):
     hlt_fps = 0.0
     tri_fps = 0.0
 
+    # Prime latest frames to avoid blocking on both streams every loop
+    # Grab one frame from each stream up-front, then alternate per loop
+    buf_h0 = device_helios2.get_buffer()
+    init_intensity, init_xyz = acquire_helios_xyz_intensity_from_buffer(
+        buf_h0, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm
+    )
+    device_helios2.requeue_buffer(buf_h0)
+
+    buf_t0 = device_triton.get_buffer()
+    init_rgb = acquire_triton_rgb_from_buffer(buf_t0)
+    # Demosaic if needed
+    if init_rgb.ndim == 3 and init_rgb.shape[2] == 1:
+        init_rgb = cv2.cvtColor(np.squeeze(init_rgb, axis=2), cv2.COLOR_BayerRG2BGR)
+    elif init_rgb.ndim == 2:
+        init_rgb = cv2.cvtColor(init_rgb, cv2.COLOR_BayerRG2BGR)
+    device_triton.requeue_buffer(buf_t0)
+
+    # Store safe copies for reuse across iterations
+    last_intensity = init_intensity.copy()
+    last_xyz = init_xyz.copy()
+    last_rgb = init_rgb.copy()
+
+    # Alternate which camera to poll each loop to avoid 2x blocking
+    poll_helios_next = True
+    last_wait_h_ms = 0.0
+    last_wait_t_ms = 0.0
+
     try:
         while True:
-            t_loop_start = time.perf_counter()
-
-            # Acquire buffers (near-simultaneous)
             t0 = time.perf_counter()
-            buffer_h = device_helios2.get_buffer()
-            t1 = time.perf_counter()
-            # Update Helios FPS
-            if hlt_last_time is not None:
-                hlt_dt = t1 - hlt_last_time
-                if hlt_dt > 0:
-                    hlt_fps = 1.0 / hlt_dt
-            hlt_last_time = t1
 
-            buffer_t = device_triton.get_buffer()
-            t2 = time.perf_counter()
-            # Update Triton FPS
-            if tri_last_time is not None:
-                tri_dt = t2 - tri_last_time
-                if tri_dt > 0:
-                    tri_fps = 1.0 / tri_dt
-            tri_last_time = t2
+            # Poll one camera per loop to avoid halving FPS due to double blocking
+            if poll_helios_next:
+                t_h0 = time.perf_counter()
+                buf_h = device_helios2.get_buffer()
+                t_h1 = time.perf_counter()
+                last_wait_h_ms = (t_h1 - t_h0) * 1000.0
+                # Update Helios FPS
+                if hlt_last_time is not None:
+                    hlt_dt = t_h1 - hlt_last_time
+                    if hlt_dt > 0:
+                        hlt_fps = 1.0 / hlt_dt
+                hlt_last_time = t_h1
 
-            # Extract frames
-            t3 = time.perf_counter()
-            rgb_image = acquire_triton_rgb_from_buffer(buffer_t)
-            t4 = time.perf_counter()
-            # Demosaic if Bayer
-            if rgb_image.ndim == 3 and rgb_image.shape[2] == 1:
-                rgb_image = cv2.cvtColor(np.squeeze(rgb_image, axis=2), cv2.COLOR_BayerRG2BGR)
-            elif rgb_image.ndim == 2:
-                rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BayerRG2BGR)
-            intensity_image, xyz_mm = acquire_helios_xyz_intensity_from_buffer(
-                buffer_h, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm
-            )
-            t5 = time.perf_counter()
+                Y_new, XYZ_new = acquire_helios_xyz_intensity_from_buffer(
+                    buf_h, xyz_scale_mm, x_offset_mm, y_offset_mm, z_offset_mm
+                )
+                device_helios2.requeue_buffer(buf_h)
+                # Safe copies for use after buffer is requeued
+                last_intensity = Y_new.copy()
+                last_xyz = XYZ_new.copy()
+                poll_helios_next = False
+            else:
+                t_t0 = time.perf_counter()
+                buf_t = device_triton.get_buffer()
+                t_t1 = time.perf_counter()
+                last_wait_t_ms = (t_t1 - t_t0) * 1000.0
+                # Update Triton FPS
+                if tri_last_time is not None:
+                    tri_dt = t_t1 - tri_last_time
+                    if tri_dt > 0:
+                        tri_fps = 1.0 / tri_dt
+                tri_last_time = t_t1
+
+                rgb_new = acquire_triton_rgb_from_buffer(buf_t)
+                # Demosaic if Bayer
+                if rgb_new.ndim == 3 and rgb_new.shape[2] == 1:
+                    rgb_new = cv2.cvtColor(np.squeeze(rgb_new, axis=2), cv2.COLOR_BayerRG2BGR)
+                elif rgb_new.ndim == 2:
+                    rgb_new = cv2.cvtColor(rgb_new, cv2.COLOR_BayerRG2BGR)
+                device_triton.requeue_buffer(buf_t)
+                last_rgb = rgb_new.copy()
+                poll_helios_next = True
+
+            # Work on the latest frames from both sensors
+            rgb_image = last_rgb
+            intensity_image = last_intensity
+            xyz_mm = last_xyz
 
             height, width = intensity_image.shape
 
@@ -515,8 +556,11 @@ def live_overlay_synced(device_triton, device_helios2):
             # FPS and stats overlay
             t_show_start = time.perf_counter()
             dt = max(time.perf_counter() - t0, 1e-6)
-            fps_txt = f"HLT: {hlt_fps:.1f} FPS  |  RGB: {tri_fps:.1f} FPS  |  decim={decimation}"
+            fps_txt = f"HLT: {hlt_fps:.1f} | RGB: {tri_fps:.1f} | OVR: {1.0/dt:.1f} | decim={decimation}"
             cv2.putText(overlay, fps_txt, (10, overlay.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+            # Show last wait times (ms) for quick diagnosis
+            wait_txt = f"Wait H:{last_wait_h_ms:.0f}ms  |  Wait R:{last_wait_t_ms:.0f}ms"
+            cv2.putText(overlay, wait_txt, (10, overlay.shape[0]-55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
             
             # Center depth and range stats
             if rows.size and np.any(valid_mask):
@@ -533,9 +577,7 @@ def live_overlay_synced(device_triton, device_helios2):
             cv2.imshow(window_name, overlay)
             t_show_end = time.perf_counter()
 
-            # Requeue buffers
-            device_helios2.requeue_buffer(buffer_h)
-            device_triton.requeue_buffer(buffer_t)
+            # Buffers already requeued immediately after acquisition
 
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q'):
